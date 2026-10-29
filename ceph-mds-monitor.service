@@ -1,0 +1,20 @@
+[Unit]
+Description=Ceph MDS WARN monitor with auto-restart of faulty MDS
+Documentation=file:/usr/local/share/ceph-mds-monitor/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/ceph-mds-monitor
+ExecStart=/usr/local/bin/ceph_mds_monitor.py
+Restart=always
+RestartSec=10
+# Скрипт работает от root, т.к. нужен доступ к docker, systemctl и точкам монтирования
+User=root
+WorkingDirectory=/usr/local/share/ceph-mds-monitor
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
