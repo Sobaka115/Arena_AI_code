@@ -7,25 +7,33 @@ ceph_mds_monitor.py
 Обходное решение для Ceph: мониторит статус кластера и при необходимости
 перезапускает проблемный MDS (Metadata Server).
 
-Сценарий (по заданию):
-  * Проверяет статус ceph каждые N секунд.
+Архитектура (по ТЗ):
+  * 3 сервера с MDS: mst1, mst2, mst3.
+  * Скрипт запускается на хосте mst1 (где примонтирован CephFS).
+  * Статус Ceph снимается ТОЛЬКО на mst1 (статус кластера общий):
+        docker exec ceph-mon-mst1 ceph health detail
+  * Из текста ошибки извлекается проблемный MDS (например,
+    mds.frm-mst1(mds.0) → хост frm-mst1) и перезапускается только он:
+        systemctl restart ceph-mds@<хост>.service
+    (на целевом хосте — локально, если это mst1, иначе через ssh).
+  * Ceph примонтирован на mst1. В период аварии хранилище может быть
+    доступно на ЧТЕНИЕ, но не на ЗАПИСЬ — поэтому мониторится именно
+    возможность записи.
+
+Сценарий:
   * Реагирует ТОЛЬКО на HEALTH_WARN. HEALTH_ERR игнорируется.
-  * При WARN + хранилище (CephFS mount) доступно — просто ждём/логируем,
-    надеясь на самовосстановление.
-  * При WARN + хранилище НЕДОСТУПНО — определяет проблемный MDS из текста
-    ошибки (slow request) и перезапускает именно его.
-  * После перезапуска: если в течение 3 минут статус всё ещё WARN —
-    больше не перезапускать MDS, пока статус HEALTH_OK не продержится
-    подряд 20 минут.
+  * WARN + запись в CephFS доступна — ждём самовосстановления.
+  * WARN + запись НЕДОСТУПНА — определить проблемный хост MDS из ошибки и
+    перезапустить только его MDS.
+  * После перезапуска: если в течение 3 мин статус всё ещё WARN —
+    больше не перезапускать, пока HEALTH_OK не продержится 20 мин подряд.
 
-Требования к окружению (сервер mst1):
-  * ceph развёрнут в Docker на этом же хосте;
-  * службы MDS (ceph-mds@<instance>) работают напрямую на хосте systemd;
-  * CephFS примонтирован на этом же хосте.
-
-Запуск:
-  python3 ceph_mds_monitor.py          # цикличный мониторинг (systemd)
-  python3 ceph_mds_monitor.py --once   # единичная проверка (отладка)
+Проверка записи:
+  * Метод "file" (по умолчанию) — создание/запись/удаление тестового файла.
+    Надёжный способ узнать, что запись действительно работает.
+  * Метод "mds_dump" — анализ ceph mds dump без записи файла.
+    Менее достоверен: MDS может быть в списке up, но клиенты всё равно не
+    могут писать. Используйте, если категорически нельзя создавать файлы.
 
 Все настройки — через переменные окружения (см. ceph-mds-monitor.env.example)
 или аргументы командной строки.
@@ -42,8 +50,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
-from typing import List, Optional, Set, Tuple, Dict, Any
+from typing import Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Конфигурация (по умолчанию — из переменных окружения)
@@ -51,21 +58,47 @@ from typing import List, Optional, Set, Tuple, Dict, Any
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
-CEPH_CONTAINER   = _env("CEPH_CONTAINER",   "")          # имя контейнера с ceph CLI ("" — ceph на хосте)
-CEPH_BIN         = _env("CEPH_BIN",         "ceph")
-CEPH_EXTRA_ARGS  = shlex.split(_env("CEPH_EXTRA_ARGS", ""))  # напр. --cluster ceph --keyring ...
-CEPH_FS          = _env("CEPH_FS",          "cephfs")
-CEPH_MOUNT       = _env("CEPH_MOUNT",       "/mnt/cephfs")
-CHECK_INTERVAL   = int(_env("CHECK_INTERVAL", "30"))      # сек между проверками
-LOG_FILE         = _env("LOG_FILE",         "/var/log/ceph-mds-monitor.log")
-LOG_LEVEL        = _env("LOG_LEVEL",        "INFO")
-MDS_RESTART_CMD  = _env("MDS_RESTART_CMD",  "systemctl restart ceph-mds@{daemon}")
-COOLDOWN_WARN_MIN = int(_env("COOLDOWN_WARN_MIN", "3"))   # мин Beobachtки после перезапуска
-HEALTH_OK_MIN    = int(_env("HEALTH_OK_MIN",   "20"))     # мин HEALTH_OK для окончания паузы
-STORAGE_TIMEOUT  = int(_env("STORAGE_TIMEOUT", "15"))     # сек на проверку доступа к хранилищу
+# Хост, с которого снимаем статус Ceph (статус общий, достаточно одного)
+CEPH_STATUS_HOST: str = _env("CEPH_STATUS_HOST", "mst1")
+
+# Префикс имени контейнера с ceph CLI на хосте статуса: ceph-mon-mst1
+CEPH_CONTAINER_PREFIX: str = _env("CEPH_CONTAINER_PREFIX", "ceph-mon-")
+
+# Список всех хостов с MDS (для справки и возможного расширения)
+CEPH_MON_HOSTS: List[str] = [h.strip() for h in _env("CEPH_MON_HOSTS", "mst1 mst2 mst3").split() if h.strip()]
+
+# SSH для удалённых хостов (mst2, mst3). Локальный хост опрашивается напрямую.
+SSH_USER: str = _env("SSH_USER", "root")
+SSH_KEY: str = _env("SSH_KEY", "")
+SSH_OPTS: List[str] = shlex.split(_env("SSH_OPTS",
+    "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"))
+
+# Точка монтирования CephFS (только на mst1, где запускается скрипт)
+CEPH_MOUNT: str = _env("CEPH_MOUNT", "/mnt/cephfs")
+CEPH_TEST_FILE: str = _env("CEPH_TEST_FILE", ".ceph-mds-monitor-write-test")
+
+# Метод проверки записи: "file" (реальная запись тестового файла) или
+# "mds_dump" (анализ ceph mds dump без создания файлов — менее достоверно).
+WRITE_CHECK_METHOD: str = _env("WRITE_CHECK_METHOD", "file")
+
+CHECK_INTERVAL: int = int(_env("CHECK_INTERVAL", "30"))
+LOG_FILE: str = _env("LOG_FILE", "/var/log/ceph-mds-monitor.log")
+LOG_LEVEL: str = _env("LOG_LEVEL", "INFO")
+
+# Шаблон команды перезапуска MDS на целевом хосте. Подставляется имя хоста.
+MDS_RESTART_CMD_TEMPLATE: str = _env("MDS_RESTART_CMD", "systemctl restart ceph-mds@{host}.service")
+
+COOLDOWN_WARN_MIN: int = int(_env("COOLDOWN_WARN_MIN", "3"))   # мин наблюдения после перезапуска
+HEALTH_OK_MIN: int = int(_env("HEALTH_OK_MIN", "20"))          # мин HEALTH_OK для сброса паузы
+WRITE_TIMEOUT: int = int(_env("WRITE_TIMEOUT", "15"))          # сек на проверку записи
 
 COOLDOWN_WARN_SEC = COOLDOWN_WARN_MIN * 60
-HEALTH_OK_SEC     = HEALTH_OK_MIN * 60
+HEALTH_OK_SEC = HEALTH_OK_MIN * 60
+
+# Имя локального хоста (тут запущен скрипт)
+LOCAL_HOST: str = os.environ.get("HOSTNAME") or subprocess.run(
+    ["hostname"], capture_output=True, text=True
+).stdout.strip()
 
 # ---------------------------------------------------------------------------
 # Логирование
@@ -93,7 +126,7 @@ def setup_logging(log_file: Optional[str], level: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Обёртка над вызовами ceph (через docker exec или напрямую)
+# Выполнение команд
 # ---------------------------------------------------------------------------
 def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
     """Выполнить команду, вернуть (rc, stdout, stderr)."""
@@ -110,199 +143,228 @@ def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
         return -1, "", f"exception running {' '.join(cmd)}: {exc}"
 
 
-def ceph_raw(args: List[str], timeout: int = 30) -> Tuple[int, str, str]:
-    """Выполнить ceph CLI с JSON-выводом (внутри контейнера или на хосте)."""
-    cmd: List[str] = []
-    if CEPH_CONTAINER:
-        cmd += ["docker", "exec", CEPH_CONTAINER]
-    cmd += [CEPH_BIN] + CEPH_EXTRA_ARGS + args + ["--format=json"]
-    return run_cmd(cmd, timeout)
-
-
-def get_ceph_health() -> Dict[str, Any]:
-    """Получить общий статус здоровья кластера (словарь health из ceph)."""
-    # Предпочитаем подробный вывод health detail, где есть тексты ошибок.
-    rc, out, err = ceph_raw(["health", "detail"])
-    if rc != 0 or not out.strip():
-        logger.debug("ceph health detail не удался (rc=%s): %s", rc, err.strip())
-        rc, out, err = ceph_raw(["-s"])
-        if rc != 0 or not out.strip():
-            raise RuntimeError(f"ceph status failed: {err.strip()}")
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"cannot parse ceph JSON output: {exc}")
-
-    health = data.get("health", {})
-    if not health and "health" not in data:
-        # Некоторые обёртки возвращают корень сразу со статусом.
-        health = data
-    return health
-
-
-def get_overall_status(health: Dict[str, Any]) -> str:
-    """Вернуть статус: HEALTH_OK / HEALTH_WARN / HEALTH_ERR / UNKNOWN."""
-    return str(health.get("status", "UNKNOWN")).upper()
-
-
-def get_mds_dump() -> Optional[Dict[str, Any]]:
-    """ceph mds dump — дополнительно уточняет состояние MDS (up/laggy/down)."""
-    rc, out, err = ceph_raw(["mds", "dump"])
-    if rc != 0 or not out.strip():
-        return None
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Проверка доступности хранилища
-# ---------------------------------------------------------------------------
-def is_storage_accessible() -> bool:
+def run_on_host(host: str, cmd: str, timeout: int = 60) -> Tuple[int, str, str]:
     """
-    Проверяет, что точка монтирования CephFS примонтирована и отвечает.
-    ls на зависшем CephFS-клиенте может висеть надолго — оборачиваем в timeout.
+    Выполнить команду на указанном хосте.
+    Локальный хост — напрямую. Удалённые — через ssh.
+    """
+    if host == LOCAL_HOST:
+        return run_cmd(shlex.split(cmd), timeout=timeout)
+
+    ssh_args: List[str] = ["ssh"] + SSH_OPTS
+    if SSH_KEY:
+        ssh_args += ["-i", SSH_KEY]
+    ssh_args += [f"{SSH_USER}@{host}", cmd]
+    return run_cmd(ssh_args, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Опрос Ceph (только на хосте статуса, по умолчанию mst1)
+# ---------------------------------------------------------------------------
+def ceph_health_on_host(host: str) -> Tuple[Optional[str], str]:
+    """
+    Вернуть (status, raw_output) для одного хоста.
+
+    status: HEALTH_OK / HEALTH_WARN / HEALTH_ERR / None
+    """
+    container = f"{CEPH_CONTAINER_PREFIX}{host}"
+    cmd = f"docker exec {container} ceph health detail"
+    rc, out, err = run_on_host(host, cmd, timeout=60)
+    if rc != 0:
+        logger.debug("ceph health detail на %s не удался (rc=%s): %s",
+                     host, rc, err.strip()[:200])
+        return None, f"error: {err.strip()}"
+
+    raw = out.strip()
+    status: Optional[str] = None
+
+    # Первая строка текстового вывода: HEALTH_WARN ..., HEALTH_OK ..., HEALTH_ERR ...
+    first_line = raw.splitlines()[0] if raw.splitlines() else ""
+    m = re.match(r"^(HEALTH_OK|HEALTH_WARN|HEALTH_ERR)\b", first_line)
+    if m:
+        status = m.group(1)
+
+    return status, raw
+
+
+def get_cluster_status() -> Tuple[Optional[str], str]:
+    """
+    Снимаем статус Ceph только с CEPH_STATUS_HOST (по умолчанию mst1).
+    Возвращает (status, raw_output).
+    """
+    return ceph_health_on_host(CEPH_STATUS_HOST)
+
+
+def extract_faulty_mds_hosts(raw: str) -> Set[str]:
+    """
+    Извлечь из текста ceph health detail имена хостов с проблемными MDS.
+
+    Формат строки в ошибке: mds.frm-mst1(mds.0): ...
+    Результат: {'frm-mst1'}
+    """
+    hosts: Set[str] = set()
+    # mds.<имя_хоста>(mds.<инстанс>) — основной формат
+    for match in re.finditer(r"mds\.([A-Za-z0-9_.\-]+)\s*\(mds\.[^)]+\)", raw):
+        hosts.add(match.group(1))
+
+    # Fallback: упоминания mds.<имя> без скобок (если формат вывода отличается)
+    if not hosts:
+        for match in re.finditer(r"\bmds\.([A-Za-z0-9_.\-]+)", raw):
+            hosts.add(match.group(1))
+
+    return hosts
+
+
+# ---------------------------------------------------------------------------
+# Проверка записи в CephFS (чтение может быть доступно, запись — нет)
+# ---------------------------------------------------------------------------
+def is_storage_writable_via_file() -> bool:
+    """
+    Проверяет возможность записи, создавая/пишая/удаляя тестовый файл.
+    Надёжный метод, но требует права на создание файла в точке монтирования.
     """
     mount = CEPH_MOUNT
     if not mount:
-        logger.debug("CEPH_MOUNT не задан — проверка хранилища пропущена")
         return True
-    if not os.path.exists(mount):
-        logger.debug("Точка монтирования %s не существует", mount)
-        return False
     if not os.path.ismount(mount):
-        logger.debug("Путь %s не является активной точкой монтирования", mount)
+        logger.debug("Точка монтирования %s не является активной точкой монтирования", mount)
         return False
+
+    test_file = os.path.join(mount, CEPH_TEST_FILE)
+    quoted_file = shlex.quote(test_file)
+    cmd = (
+        f"timeout {WRITE_TIMEOUT} bash -c "
+        f"'echo ceph-mds-monitor-test > {quoted_file} && "
+        f"cat {quoted_file} && "
+        f"rm -f {quoted_file}'"
+    )
     try:
-        proc = subprocess.run(
-            ["timeout", str(STORAGE_TIMEOUT), "ls", mount],
-            capture_output=True, text=True, timeout=STORAGE_TIMEOUT + 5,
+        rc, out, err = run_cmd(["bash", "-c", cmd], timeout=WRITE_TIMEOUT + 5)
+        if rc == 0 and "ceph-mds-monitor-test" in out:
+            return True
+        logger.debug(
+            "Проверка записи (file) не прошла: rc=%s out=%s err=%s",
+            rc, out.strip()[:100], err.strip()[:100]
         )
-        if proc.returncode != 0:
-            logger.debug("ls %s завершён с кодом %s", mount, proc.returncode)
-            return False
-    except Exception as exc:
-        logger.debug("Ошибка при проверке доступа к %s: %s", mount, exc)
         return False
+    except Exception as exc:
+        logger.debug("Исключение при проверке записи (file): %s", exc)
+        return False
+
+
+def _mds_names_from_dump(value) -> Set[str]:
+    """Достаёт имена MDS из структуры ceph mds dump (без префикса mds.)."""
+    result: Set[str] = set()
+    if isinstance(value, dict):
+        for k in value.keys():
+            s = str(k)
+            result.add(s[len("mds."):] if s.startswith("mds.") else s)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                for k in item.keys():
+                    s = str(k)
+                    result.add(s[len("mds."):] if s.startswith("mds.") else s)
+            else:
+                s = str(item)
+                result.add(s[len("mds."):] if s.startswith("mds.") else s)
+    elif isinstance(value, str):
+        s = value
+        result.add(s[len("mds."):] if s.startswith("mds.") else s)
+    return result
+
+
+def is_storage_writable_via_mds_dump() -> bool:
+    """
+    Проверяет возможность записи через анализ ceph mds dump без создания файлов.
+
+    Менее достоверно: MDS может быть в списке up, но клиенты всё равно не
+    могут писать (capability release не отвечает). Используйте только если
+    категорически нельзя создавать файлы в точке монтирования.
+    """
+    # Сначала берём статус на хосте статуса, чтобы понять общую картину.
+    status, raw = get_cluster_status()
+    if status is None:
+        logger.debug("Не удалось получить статус ceph для mds_dump-проверки")
+        return False
+
+    # Получаем mds dump с того же хоста.
+    container = f"{CEPH_CONTAINER_PREFIX}{CEPH_STATUS_HOST}"
+    cmd = f"docker exec {container} ceph mds dump --format=json"
+    rc, out, err = run_on_host(CEPH_STATUS_HOST, cmd, timeout=60)
+    if rc != 0 or not out.strip():
+        logger.debug("ceph mds dump не удался (rc=%s): %s", rc, err.strip()[:200])
+        return False
+
+    try:
+        data = json.loads(out)
+    except Exception as exc:
+        logger.debug("Не удалось распарсить ceph mds dump JSON: %s", exc)
+        return False
+
+    mdsmap = (data.get("fsmap", {}).get("mdsmap", {})) or {}
+
+    up = _mds_names_from_dump(mdsmap.get("up"))
+    laggy = _mds_names_from_dump(mdsmap.get("laggy"))
+    down = _mds_names_from_dump(mdsmap.get("down"))
+    down |= _mds_names_from_dump(mdsmap.get("failed"))
+
+    # Извлекаем проблемные хосты из текста ошибки.
+    faulty = extract_faulty_mds_hosts(raw)
+    if not faulty:
+        # Если в ошибке нет явного mds.<host>, полагаемся на дамп:
+        # если есть хосты в laggy/down — запись скорее всего недоступна.
+        if laggy or down:
+            logger.debug("mds_dump: есть проблемные MDS (laggy=%s, down=%s)",
+                         laggy, down)
+            return False
+        return True
+
+    # Если хост из ошибки не в up или в laggy/down — запись недоступна.
+    for host in faulty:
+        if host in down or host in laggy:
+            logger.debug("mds_dump: хост %s в laggy/down — запись недоступна", host)
+            return False
+        if host not in up:
+            logger.debug("mds_dump: хост %s отсутствует в up — запись недоступна", host)
+            return False
+
+    logger.debug("mds_dump: все проблемные хосты (%s) в up, нет laggy/down", faulty)
     return True
 
 
-# ---------------------------------------------------------------------------
-# Определение проблемного MDS
-# ---------------------------------------------------------------------------
-MDS_NAME_RE = re.compile(r"mds\.([A-Za-z0-9_.\-]+)")
-
-
-def _extract_mds_candidates(health: Dict[str, Any]) -> Set[str]:
-    """Достаёт имена mds.<имя> из всего текста health detail."""
-    candidates: Set[str] = set()
-    text = json.dumps(health, ensure_ascii=False)
-    for match in MDS_NAME_RE.finditer(text):
-        candidates.add(match.group(1))
-    return candidates
-
-
-def _mds_state_from_dump(mds_dump: Optional[Dict[str, Any]]) -> Tuple[Set[str], Set[str], Set[str]]:
+def is_storage_writable() -> bool:
     """
-    Из ceph mds dump возвращает (up, laggy, down) множества имён MDS без префикса mds.
-    Структура ответа зависит от версии Ceph, поэтому 접근 보호щённый.
+    Проверяет, что в CephFS можно записать данные.
+    Метод выбирается переменной WRITE_CHECK_METHOD (file или mds_dump).
     """
-    up: Set[str] = set()
-    laggy: Set[str] = set()
-    down: Set[str] = set()
-    if not mds_dump:
-        return up, laggy, down
-
-    mdsmap = mds_dump.get("fsmap", {}).get("mdsmap", {}) or {}
-
-    def _names(value: Any) -> Set[str]:
-        result: Set[str] = set()
-        if isinstance(value, dict):
-            result.update(str(k) for k in value.keys())
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    result.update(str(k) for k in item.keys())
-                else:
-                    result.add(str(item))
-        elif isinstance(value, str):
-            result.add(value)
-        return result
-
-    up = _names(mdsmap.get("up"))
-    laggy = _names(mdsmap.get("laggy"))
-    down = _names(mdsmap.get("down"))
-    # Некоторые версии кладут "вypadшие" MDS в 'failed' / 'standing'
-    down |= _names(mdsmap.get("failed"))
-    return up, laggy, down
-
-
-def find_faulty_mds(health: Dict[str, Any]) -> Optional[str]:
-    """
-    Определяет экземпляр MDS, на котором произошла ошибка (slow request).
-
-    Приоритет:
-      1. Имя, встреченное в тексте ошибки health detail;
-      2. Из тех, кто не в up или в laggy/down по mds dump;
-      3. Иначе — первый попавшийся кандидат.
-    """
-    candidates = _extract_mds_candidates(health)
-    if not candidates:
-        logger.warning("Не найдено упоминаний mds.<имя> в выводе ceph health detail")
-        return None
-
-    mds_dump = get_mds_dump()
-    up, laggy, down = _mds_state_from_dump(mds_dump)
-
-    # Нормализуем имена: уберём префикс mds., если он есть в stati дампа.
-    up_norm = {n[len("mds."):] if n.startswith("mds.") else n for n in up}
-    laggy_norm = {n[len("mds."):] if n.startswith("mds.") else n for n in laggy}
-    down_norm = {n[len("mds."):] if n.startswith("mds.") else n for n in down}
-
-    def norm(name: str) -> str:
-        return name[len("mds."):] if name.startswith("mds.") else name
-
-    # 1. Кандидаты, которые явно проблемны по дампу.
-    for name in sorted(candidates):
-        short = norm(name)
-        if short in laggy_norm or short in down_norm:
-            logger.info("MDS %s помечен как laggy/down в ceph mds dump", name)
-            return name
-
-    # 2. Кандидаты, которых нет в up.
-    for name in sorted(candidates):
-        short = norm(name)
-        if short not in up_norm:
-            logger.info("MDS %s отсутствует в списке up (ceph mds dump)", name)
-            return name
-
-    # 3. Берём первого кандидата по алфавиту — это лучше, чем угадывать слепо.
-    chosen = sorted(candidates)[0]
-    logger.info("Явного проблемного MDS в дампе не найдено, берём кандидата из ошибки: %s", chosen)
-    return chosen
+    if WRITE_CHECK_METHOD == "mds_dump":
+        logger.debug("Проверка записи через mds_dump (без создания файла)")
+        return is_storage_writable_via_mds_dump()
+    # По умолчанию — реальная запись тестового файла.
+    return is_storage_writable_via_file()
 
 
 # ---------------------------------------------------------------------------
-# Перезапуск MDS
+# Перезапуск MDS на целевом хосте
 # ---------------------------------------------------------------------------
-def restart_mds(instance: str) -> bool:
+def restart_mds_on_host(host: str) -> bool:
     """
-    Перезапускает службу MDS на хосте.
-    instance — часть имени после mds., например mst1.
-    Команда по умолчанию: systemctl restart ceph-mds@<instance>
+    Перезапускает службу MDS на целевом хосте.
+    Команда по умолчанию: systemctl restart ceph-mds@<host>.service
     """
-    cmd_str = MDS_RESTART_CMD.replace("{daemon}", instance)
-    cmd = shlex.split(cmd_str)
-    logger.info("Выполняется перезапуск MDS: %s", cmd_str)
-    rc, out, err = run_cmd(cmd, timeout=60)
+    cmd = MDS_RESTART_CMD_TEMPLATE.replace("{host}", host)
+    logger.info("Перезапуск MDS на хосте %s: %s", host, cmd)
+    rc, out, err = run_on_host(host, cmd, timeout=60)
     if rc == 0:
-        logger.info("MDS %s успешно перезапущен (rc=0). Вывод: %s",
-                    instance, out.strip()[:500] if out.strip() else "—")
+        logger.info(
+            "MDS на хосте %s перезапущен успешно (rc=0). %s",
+            host, out.strip()[:300] if out.strip() else "—"
+        )
         return True
     logger.error(
-        "Не удалось перезапустить MDS %s (rc=%s). stderr: %s stdout: %s",
-        instance, rc, err.strip()[:500], out.strip()[:500]
+        "Не удалось перезапустить MDS на хосте %s (rc=%s). stderr: %s stdout: %s",
+        host, rc, err.strip()[:300], out.strip()[:300]
     )
     return False
 
@@ -312,14 +374,17 @@ def restart_mds(instance: str) -> bool:
 # ---------------------------------------------------------------------------
 class MonitorState:
     def __init__(self) -> None:
-        self.last_restart: Optional[float] = None   # метка времени последнего перезапуска MDS
-        self.health_ok_since: Optional[float] = None  # когда 처음으로 увидели HEALTH_OK в текущей серии
-        self.in_cooldown: bool = False              # пауза перезапусков (3 мин WARN → ждём HEALTH_OK 20 мин)
+        self.last_restart: Optional[float] = None      # метка времени последнего перезапуска MDS
+        self.health_ok_since: Optional[float] = None   # когда впервые увидели HEALTH_OK в текущей серии
+        self.in_cooldown: bool = False                 # пауза перезапусков
 
 
-def evaluate(health: Dict[str, Any], state: MonitorState, now: float) -> None:
+def evaluate(status: Optional[str], raw: str, state: MonitorState, now: float) -> None:
     """Одна итерация принятия решения."""
-    status = get_overall_status(health)
+    if status is None:
+        logger.warning("Не удалось определить статус Ceph — пропускаем итерацию")
+        return
+
     logger.info("Статус Ceph: %s", status)
 
     if status == "HEALTH_OK":
@@ -347,13 +412,13 @@ def evaluate(health: Dict[str, Any], state: MonitorState, now: float) -> None:
         return
 
     # ---------------- HEALTH_WARN ----------------
-    accessible = is_storage_accessible()
+    writable = is_storage_writable()
 
-    if accessible:
-        logger.info("WARN, но хранилище %s доступно — ждём самовосстановления Ceph", CEPH_MOUNT)
+    if writable:
+        logger.info("WARN, но запись в %s доступна — ждём самовосстановления Ceph", CEPH_MOUNT)
         return
 
-    # WARN + хранилище недоступно — необходимо действовать.
+    # WARN + запись недоступна — необходимо действовать.
 
     if state.in_cooldown:
         logger.info(
@@ -379,23 +444,32 @@ def evaluate(health: Dict[str, Any], state: MonitorState, now: float) -> None:
         state.in_cooldown = True
         return
 
-    # Первое обнаружение: определяем проблемный MDS и перезапускаем его.
-    instance = find_faulty_mds(health)
-    if instance is None:
+    # Первый discovery: определяем проблемный хост MDS из ошибки и перезапускаем его.
+    faulty = extract_faulty_mds_hosts(raw)
+    if not faulty:
         logger.error(
-            "WARN и хранилище недоступно, но проблемный MDS не определён — "
+            "WARN и запись в CephFS недоступна, но проблемный MDS хост не определён из ошибки — "
             "перезапуск невозможен, ждём следующей проверки"
         )
         return
 
-    logger.info("Обнаружен проблемный MDS %s — перезапуск", instance)
-    if restart_mds(instance):
+    restarted_any = False
+    for host in sorted(faulty):
+        logger.info(
+            "Обнаружен проблемный MDS на хосте %s — перезапуск ceph-mds@%s.service", host, host
+        )
+        if restart_mds_on_host(host):
+            restarted_any = True
+
+    if restarted_any:
         state.last_restart = now
         state.in_cooldown = False
-        logger.info("MDS %s перезапущен. Отсчёт %d мин до возможного повторного действия",
-                    instance, COOLDOWN_WARN_MIN)
+        logger.info(
+            "Перезапуск MDS выполнен. Отсчёт %d мин до возможного повторного действия",
+            COOLDOWN_WARN_MIN
+        )
     else:
-        logger.error("Перезапуск MDS %s не удался", instance)
+        logger.error("Не удалось перезапустить ни один проблемный MDS")
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +494,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Интервал проверок в секундах")
     parser.add_argument("--mount", default=CEPH_MOUNT,
                         help="Точка монтирования CephFS")
-    parser.add_argument("--container", default=CEPH_CONTAINER,
-                        help="Имя Docker-контейнера с ceph CLI")
     parser.add_argument("--log-file", default=LOG_FILE,
                         help="Путь к файлу лога")
     parser.add_argument("--log-level", default=LOG_LEVEL,
@@ -433,9 +505,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     # Переопределяем настройки из аргументов.
-    global CEPH_MOUNT, CEPH_CONTAINER, LOG_FILE, LOG_LEVEL, CHECK_INTERVAL
+    global CEPH_MOUNT, LOG_FILE, LOG_LEVEL, CHECK_INTERVAL
     CEPH_MOUNT = args.mount
-    CEPH_CONTAINER = args.container
     LOG_FILE = args.log_file
     LOG_LEVEL = args.log_level
     CHECK_INTERVAL = args.interval
@@ -445,18 +516,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    state = MonitorState()
     logger.info(
-        "ceph-mds-monitor запущен. interval=%ds, mount=%s, container=%s, "
-        "cooldown_warn=%dmin, health_ok_required=%dmin",
-        CHECK_INTERVAL, CEPH_MOUNT or "<не задан>", CEPH_CONTAINER or "<хост>",
-        COOLDOWN_WARN_MIN, HEALTH_OK_MIN
+        "ceph-mds-monitor запущен. interval=%ds, mount=%s, status_host=%s, "
+        "local_host=%s, write_check=%s, cooldown_warn=%dmin, health_ok_required=%dmin",
+        CHECK_INTERVAL, CEPH_MOUNT or "<не задан>", CEPH_STATUS_HOST,
+        LOCAL_HOST, WRITE_CHECK_METHOD, COOLDOWN_WARN_MIN, HEALTH_OK_MIN
     )
+
+    state = MonitorState()
 
     while running:
         now = time.time()
         try:
-            health = get_ceph_health()
+            status, raw = get_cluster_status()
         except Exception as exc:
             logger.error("Не удалось получить статус ceph: %s", exc)
             if args.once:
@@ -464,10 +536,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             time.sleep(CHECK_INTERVAL)
             continue
 
-        evaluate(health, state, now)
+        evaluate(status, raw, state, now)
 
         if args.once:
-            status = get_overall_status(health)
             logger.info("Одиночная проверка завершена, статус: %s", status)
             return 0
 
