@@ -1,0 +1,5 @@
+*.mp3
+*.mp4
+audio/*.mp3
+video/*
+vo_work/
