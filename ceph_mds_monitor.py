@@ -18,29 +18,27 @@ ceph_mds_monitor.py
     (на целевом хосте — локально, если это mst1, иначе через ssh).
   * Ceph примонтирован на mst1. В период аварии хранилище может быть
     доступно на ЧТЕНИЕ, но не на ЗАПИСЬ — поэтому мониторится именно
-    возможность записи.
+    возможность записи (создание/запись/удаление тестового файла).
 
 Сценарий:
   * Реагирует ТОЛЬКО на HEALTH_WARN. HEALTH_ERR игнорируется.
-  * WARN + запись в CephFS доступна — ждём самовосстановления.
-  * WARN + запись НЕДОСТУПНА — определить проблемный хост MDS из ошибки и
-    перезапустить только его MDS.
+  * WARN реагирует только если в выводе ceph health detail найден хотя бы
+    один из целевых признаков ошибки (см. WARN_ERROR_PATTERNS, по умолчанию:
+    MDS_SLOW_REQUEST, MDS_CLIENT_LATE_RELEASE, slow requests,
+    failing to respond to capability release). Список расширяется через
+    переменную окружения.
+  * Если WARN + целевой признак ошибки + запись в CephFS доступна —
+    ждём самовосстановления, не перезапуская MDS.
+  * Если WARN + целевой признак ошибки + запись НЕДОСТУПНА — определить
+    проблемный хост MDS из ошибки и перезапустить только его.
   * После перезапуска: если в течение 3 мин статус всё ещё WARN —
     больше не перезапускать, пока HEALTH_OK не продержится 20 мин подряд.
-
-Проверка записи:
-  * Метод "file" (по умолчанию) — создание/запись/удаление тестового файла.
-    Надёжный способ узнать, что запись действительно работает.
-  * Метод "mds_dump" — анализ ceph mds dump без записи файла.
-    Менее достоверен: MDS может быть в списке up, но клиенты всё равно не
-    могут писать. Используйте, если категорически нельзя создавать файлы.
 
 Все настройки — через переменные окружения (см. ceph-mds-monitor.env.example)
 или аргументы командной строки.
 """
 
 import argparse
-import json
 import logging
 import logging.handlers
 import os
@@ -50,13 +48,17 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Конфигурация (по умолчанию — из переменных окружения)
 # ---------------------------------------------------------------------------
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
+
+def _env_list(name: str, default: str) -> List[str]:
+    raw = _env(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 # Хост, с которого снимаем статус Ceph (статус общий, достаточно одного)
 CEPH_STATUS_HOST: str = _env("CEPH_STATUS_HOST", "mst1")
@@ -77,9 +79,12 @@ SSH_OPTS: List[str] = shlex.split(_env("SSH_OPTS",
 CEPH_MOUNT: str = _env("CEPH_MOUNT", "/mnt/cephfs")
 CEPH_TEST_FILE: str = _env("CEPH_TEST_FILE", ".ceph-mds-monitor-write-test")
 
-# Метод проверки записи: "file" (реальная запись тестового файла) или
-# "mds_dump" (анализ ceph mds dump без создания файлов — менее достоверно).
-WRITE_CHECK_METHOD: str = _env("WRITE_CHECK_METHOD", "file")
+# Целевые признаки ошибок в ceph health detail, при которых скрипт реагирует
+# на HEALTH_WARN. Если ни одного признака не найдено — WARN игнорируется.
+# Список задаётся через запятую, пример:
+#   WARN_ERROR_PATTERNS="MDS_SLOW_REQUEST,MDS_CLIENT_LATE_RELEASE,slow requests,failing to respond to capability release"
+WARN_ERROR_PATTERNS: List[str] = _env_list("WARN_ERROR_PATTERNS",
+    "MDS_SLOW_REQUEST,MDS_CLIENT_LATE_RELEASE,slow requests,failing to respond to capability release")
 
 CHECK_INTERVAL: int = int(_env("CHECK_INTERVAL", "30"))
 LOG_FILE: str = _env("LOG_FILE", "/var/log/ceph-mds-monitor.log")
@@ -195,6 +200,19 @@ def get_cluster_status() -> Tuple[Optional[str], str]:
     return ceph_health_on_host(CEPH_STATUS_HOST)
 
 
+def has_target_error_patterns(raw: str) -> bool:
+    """
+    Проверяет, есть ли в выводе ceph health detail хотя бы один из
+    целевых признаков ошибки (WARN_ERROR_PATTERNS).
+    """
+    for pattern in WARN_ERROR_PATTERNS:
+        if re.search(re.escape(pattern), raw, flags=re.IGNORECASE):
+            logger.debug("Найден целевой признак ошибки: %s", pattern)
+            return True
+    logger.debug("Целевые признаки ошибки не найдены в выводе ceph health detail")
+    return False
+
+
 def extract_faulty_mds_hosts(raw: str) -> Set[str]:
     """
     Извлечь из текста ceph health detail имена хостов с проблемными MDS.
@@ -218,10 +236,12 @@ def extract_faulty_mds_hosts(raw: str) -> Set[str]:
 # ---------------------------------------------------------------------------
 # Проверка записи в CephFS (чтение может быть доступно, запись — нет)
 # ---------------------------------------------------------------------------
-def is_storage_writable_via_file() -> bool:
+def is_storage_writable() -> bool:
     """
-    Проверяет возможность записи, создавая/пишая/удаляя тестовый файл.
-    Надёжный метод, но требует права на создание файла в точке монтирования.
+    Проверяет, что в CephFS можно записать данные.
+    Создаёт/пишет/удаляет тестовый файл в точке монтирования с таймаутом.
+    Это единственный надёжный способ узнать, что запись действительно работает:
+    чтение может быть доступно, а запись — нет.
     """
     mount = CEPH_MOUNT
     if not mount:
@@ -243,106 +263,13 @@ def is_storage_writable_via_file() -> bool:
         if rc == 0 and "ceph-mds-monitor-test" in out:
             return True
         logger.debug(
-            "Проверка записи (file) не прошла: rc=%s out=%s err=%s",
+            "Проверка записи не прошла: rc=%s out=%s err=%s",
             rc, out.strip()[:100], err.strip()[:100]
         )
         return False
     except Exception as exc:
-        logger.debug("Исключение при проверке записи (file): %s", exc)
+        logger.debug("Исключение при проверке записи: %s", exc)
         return False
-
-
-def _mds_names_from_dump(value) -> Set[str]:
-    """Достаёт имена MDS из структуры ceph mds dump (без префикса mds.)."""
-    result: Set[str] = set()
-    if isinstance(value, dict):
-        for k in value.keys():
-            s = str(k)
-            result.add(s[len("mds."):] if s.startswith("mds.") else s)
-    elif isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict):
-                for k in item.keys():
-                    s = str(k)
-                    result.add(s[len("mds."):] if s.startswith("mds.") else s)
-            else:
-                s = str(item)
-                result.add(s[len("mds."):] if s.startswith("mds.") else s)
-    elif isinstance(value, str):
-        s = value
-        result.add(s[len("mds."):] if s.startswith("mds.") else s)
-    return result
-
-
-def is_storage_writable_via_mds_dump() -> bool:
-    """
-    Проверяет возможность записи через анализ ceph mds dump без создания файлов.
-
-    Менее достоверно: MDS может быть в списке up, но клиенты всё равно не
-    могут писать (capability release не отвечает). Используйте только если
-    категорически нельзя создавать файлы в точке монтирования.
-    """
-    # Сначала берём статус на хосте статуса, чтобы понять общую картину.
-    status, raw = get_cluster_status()
-    if status is None:
-        logger.debug("Не удалось получить статус ceph для mds_dump-проверки")
-        return False
-
-    # Получаем mds dump с того же хоста.
-    container = f"{CEPH_CONTAINER_PREFIX}{CEPH_STATUS_HOST}"
-    cmd = f"docker exec {container} ceph mds dump --format=json"
-    rc, out, err = run_on_host(CEPH_STATUS_HOST, cmd, timeout=60)
-    if rc != 0 or not out.strip():
-        logger.debug("ceph mds dump не удался (rc=%s): %s", rc, err.strip()[:200])
-        return False
-
-    try:
-        data = json.loads(out)
-    except Exception as exc:
-        logger.debug("Не удалось распарсить ceph mds dump JSON: %s", exc)
-        return False
-
-    mdsmap = (data.get("fsmap", {}).get("mdsmap", {})) or {}
-
-    up = _mds_names_from_dump(mdsmap.get("up"))
-    laggy = _mds_names_from_dump(mdsmap.get("laggy"))
-    down = _mds_names_from_dump(mdsmap.get("down"))
-    down |= _mds_names_from_dump(mdsmap.get("failed"))
-
-    # Извлекаем проблемные хосты из текста ошибки.
-    faulty = extract_faulty_mds_hosts(raw)
-    if not faulty:
-        # Если в ошибке нет явного mds.<host>, полагаемся на дамп:
-        # если есть хосты в laggy/down — запись скорее всего недоступна.
-        if laggy or down:
-            logger.debug("mds_dump: есть проблемные MDS (laggy=%s, down=%s)",
-                         laggy, down)
-            return False
-        return True
-
-    # Если хост из ошибки не в up или в laggy/down — запись недоступна.
-    for host in faulty:
-        if host in down or host in laggy:
-            logger.debug("mds_dump: хост %s в laggy/down — запись недоступна", host)
-            return False
-        if host not in up:
-            logger.debug("mds_dump: хост %s отсутствует в up — запись недоступна", host)
-            return False
-
-    logger.debug("mds_dump: все проблемные хосты (%s) в up, нет laggy/down", faulty)
-    return True
-
-
-def is_storage_writable() -> bool:
-    """
-    Проверяет, что в CephFS можно записать данные.
-    Метод выбирается переменной WRITE_CHECK_METHOD (file или mds_dump).
-    """
-    if WRITE_CHECK_METHOD == "mds_dump":
-        logger.debug("Проверка записи через mds_dump (без создания файла)")
-        return is_storage_writable_via_mds_dump()
-    # По умолчанию — реальная запись тестового файла.
-    return is_storage_writable_via_file()
 
 
 # ---------------------------------------------------------------------------
@@ -412,13 +339,22 @@ def evaluate(status: Optional[str], raw: str, state: MonitorState, now: float) -
         return
 
     # ---------------- HEALTH_WARN ----------------
+
+    # Реагируем только если в выводе есть целевые признаки ошибки.
+    if not has_target_error_patterns(raw):
+        logger.info(
+            "WARN, но целевые признаки ошибки (%s) не найдены — ждём самовосстановления",
+            WARN_ERROR_PATTERNS
+        )
+        return
+
     writable = is_storage_writable()
 
     if writable:
-        logger.info("WARN, но запись в %s доступна — ждём самовосстановления Ceph", CEPH_MOUNT)
+        logger.info("WARN с целевой ошибкой, но запись в %s доступна — ждём самовосстановления Ceph", CEPH_MOUNT)
         return
 
-    # WARN + запись недоступна — необходимо действовать.
+    # WARN + целевая ошибка + запись недоступна — необходимо действовать.
 
     if state.in_cooldown:
         logger.info(
@@ -448,8 +384,8 @@ def evaluate(status: Optional[str], raw: str, state: MonitorState, now: float) -
     faulty = extract_faulty_mds_hosts(raw)
     if not faulty:
         logger.error(
-            "WARN и запись в CephFS недоступна, но проблемный MDS хост не определён из ошибки — "
-            "перезапуск невозможен, ждём следующей проверки"
+            "WARN с целевой ошибкой и запись в CephFS недоступна, но проблемный MDS хост "
+            "не определён из ошибки — перезапуск невозможен, ждём следующей проверки"
         )
         return
 
@@ -518,9 +454,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger.info(
         "ceph-mds-monitor запущен. interval=%ds, mount=%s, status_host=%s, "
-        "local_host=%s, write_check=%s, cooldown_warn=%dmin, health_ok_required=%dmin",
+        "local_host=%s, warn_patterns=%s, cooldown_warn=%dmin, health_ok_required=%dmin",
         CHECK_INTERVAL, CEPH_MOUNT or "<не задан>", CEPH_STATUS_HOST,
-        LOCAL_HOST, WRITE_CHECK_METHOD, COOLDOWN_WARN_MIN, HEALTH_OK_MIN
+        LOCAL_HOST, ", ".join(WARN_ERROR_PATTERNS), COOLDOWN_WARN_MIN, HEALTH_OK_MIN
     )
 
     state = MonitorState()
