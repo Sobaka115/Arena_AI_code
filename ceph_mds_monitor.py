@@ -5,17 +5,20 @@ ceph_mds_monitor.py
 ===================
 
 Обходное решение для Ceph: мониторит статус кластера и при необходимости
-перезапускает проблемный MDS (Metadata Server).
+перезапускает problematic MDS (Metadata Server).
+
+Разработано для запуска от обычного пользователя с правами sudo (без пароля root).
+Все команды, требующие root, выполняются через sudo.
 
 Архитектура (по ТЗ):
   * 3 сервера с MDS: mst1, mst2, mst3.
   * Скрипт запускается на хосте mst1 (где примонтирован CephFS).
   * Статус Ceph снимается ТОЛЬКО на mst1 (статус кластера общий):
-        docker exec ceph-mon-mst1 ceph health detail
+        sudo docker exec ceph-mon-mst1 ceph health detail
   * Из текста ошибки извлекается проблемный MDS (например,
     mds.frm-mst1(mds.0) → хост frm-mst1) и перезапускается только он:
-        systemctl restart ceph-mds@<хост>.service
-    (на целевом хосте — локально, если это mst1, иначе через ssh).
+        sudo systemctl restart ceph-mds@<хост>.service   (локально)
+        ssh <user>@<хост> sudo systemctl restart ceph-mds@<хост>.service  (удалённо)
   * Ceph примонтирован на mst1. В период аварии хранилище может быть
     доступно на ЧТЕНИЕ, но не на ЗАПИСЬ — поэтому мониторится именно
     возможность записи (создание/запись/удаление тестового файла).
@@ -70,10 +73,14 @@ CEPH_CONTAINER_PREFIX: str = _env("CEPH_CONTAINER_PREFIX", "ceph-mon-")
 CEPH_MON_HOSTS: List[str] = [h.strip() for h in _env("CEPH_MON_HOSTS", "mst1 mst2 mst3").split() if h.strip()]
 
 # SSH для удалённых хостов (mst2, mst3). Локальный хост опрашивается напрямую.
-SSH_USER: str = _env("SSH_USER", "root")
+SSH_USER: str = _env("SSH_USER", os.environ.get("USER", "root"))
 SSH_KEY: str = _env("SSH_KEY", "")
 SSH_OPTS: List[str] = shlex.split(_env("SSH_OPTS",
     "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"))
+
+# Префикс команд, требующих root (docker, systemctl). Оставьте пустым, если
+# скрипт запускается от root; укажите "sudo" для обычного пользователя с sudo.
+SUDO: str = _env("SUDO", "sudo")
 
 # Точка монтирования CephFS (только на mst1, где запускается скрипт)
 CEPH_MOUNT: str = _env("CEPH_MOUNT", "/mnt/cephfs")
@@ -87,11 +94,13 @@ WARN_ERROR_PATTERNS: List[str] = _env_list("WARN_ERROR_PATTERNS",
     "MDS_SLOW_REQUEST,MDS_CLIENT_LATE_RELEASE,slow requests,failing to respond to capability release")
 
 CHECK_INTERVAL: int = int(_env("CHECK_INTERVAL", "30"))
-LOG_FILE: str = _env("LOG_FILE", "/var/log/ceph-mds-monitor.log")
+LOG_FILE: str = _env("LOG_FILE", os.path.expanduser("~/ceph-mds-monitor.log"))
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO")
 
 # Шаблон команды перезапуска MDS на целевом хосте. Подставляется имя хоста.
-MDS_RESTART_CMD_TEMPLATE: str = _env("MDS_RESTART_CMD", "systemctl restart ceph-mds@{host}.service")
+# Локально: sudo systemctl restart ceph-mds@{host}.service
+# Удалённо: ssh {user}@{host} sudo systemctl restart ceph-mds@{host}.service
+MDS_RESTART_CMD_TEMPLATE: str = _env("MDS_RESTART_CMD", "sudo systemctl restart ceph-mds@{host}.service")
 
 COOLDOWN_WARN_MIN: int = int(_env("COOLDOWN_WARN_MIN", "3"))   # мин наблюдения после перезапуска
 HEALTH_OK_MIN: int = int(_env("HEALTH_OK_MIN", "20"))          # мин HEALTH_OK для сброса паузы
@@ -133,34 +142,43 @@ def setup_logging(log_file: Optional[str], level: str) -> None:
 # ---------------------------------------------------------------------------
 # Выполнение команд
 # ---------------------------------------------------------------------------
-def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
+def run_cmd(cmd: List[str], timeout: int = 30, use_sudo: bool = False) -> Tuple[int, str, str]:
     """Выполнить команду, вернуть (rc, stdout, stderr)."""
+    final_cmd: List[str] = []
+    if use_sudo and SUDO:
+        final_cmd += shlex.split(SUDO)
+    final_cmd += cmd
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            final_cmd, capture_output=True, text=True, timeout=timeout
         )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
-        return -1, "", f"command timed out after {timeout}s: {' '.join(cmd)}"
+        return -1, "", f"command timed out after {timeout}s: {' '.join(final_cmd)}"
     except FileNotFoundError:
-        return -1, "", f"command not found: {cmd[0]}"
+        return -1, "", f"command not found: {final_cmd[0]}"
     except Exception as exc:  # pragma: no cover - защитная ветка
-        return -1, "", f"exception running {' '.join(cmd)}: {exc}"
+        return -1, "", f"exception running {' '.join(final_cmd)}: {exc}"
 
 
 def run_on_host(host: str, cmd: str, timeout: int = 60) -> Tuple[int, str, str]:
     """
     Выполнить команду на указанном хосте.
-    Локальный хост — напрямую. Удалённые — через ssh.
+    Локальный хост — напрямую (с sudo если нужно). Удалённые — через ssh (с sudo на удалённой стороне).
     """
+    # Если команда требует sudo, добавляем её перед самой командой
+    full_cmd = cmd
+
     if host == LOCAL_HOST:
-        return run_cmd(shlex.split(cmd), timeout=timeout)
+        return run_cmd(shlex.split(full_cmd), timeout=timeout, use_sudo=True)
 
     ssh_args: List[str] = ["ssh"] + SSH_OPTS
     if SSH_KEY:
         ssh_args += ["-i", SSH_KEY]
-    ssh_args += [f"{SSH_USER}@{host}", cmd]
-    return run_cmd(ssh_args, timeout=timeout)
+    # На удалённомホсте тоже используем sudo для systemctl
+    remote_cmd = f"sudo {full_cmd}" if not full_cmd.startswith("sudo ") else full_cmd
+    ssh_args += [f"{SSH_USER}@{host}", remote_cmd]
+    return run_cmd(ssh_args, timeout=timeout, use_sudo=False)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +296,7 @@ def is_storage_writable() -> bool:
 def restart_mds_on_host(host: str) -> bool:
     """
     Перезапускает службу MDS на целевом хосте.
-    Команда по умолчанию: systemctl restart ceph-mds@<host>.service
+    Команда по умолчанию: sudo systemctl restart ceph-mds@<host>.service
     """
     cmd = MDS_RESTART_CMD_TEMPLATE.replace("{host}", host)
     logger.info("Перезапуск MDS на хосте %s: %s", host, cmd)
@@ -454,9 +472,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger.info(
         "ceph-mds-monitor запущен. interval=%ds, mount=%s, status_host=%s, "
-        "local_host=%s, warn_patterns=%s, cooldown_warn=%dmin, health_ok_required=%dmin",
+        "local_host=%s, sudo=%s, warn_patterns=%s, cooldown_warn=%dmin, health_ok_required=%dmin",
         CHECK_INTERVAL, CEPH_MOUNT or "<не задан>", CEPH_STATUS_HOST,
-        LOCAL_HOST, ", ".join(WARN_ERROR_PATTERNS), COOLDOWN_WARN_MIN, HEALTH_OK_MIN
+        LOCAL_HOST, SUDO or "<нет>", ", ".join(WARN_ERROR_PATTERNS), COOLDOWN_WARN_MIN, HEALTH_OK_MIN
     )
 
     state = MonitorState()
