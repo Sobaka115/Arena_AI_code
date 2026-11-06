@@ -2,6 +2,8 @@
 
 Обходное решение для проблемы с Ceph в Docker на серверах **mst1, mst2, mst3**.
 
+Скрипт предназначен для запуска от **обычного пользователя с правами sudo** (без пароля root).
+
 ## Проблема
 
 Ceph иногда переходит в статус `WARN` с ошибками **slow request** / **clients failing to respond to capability release** (MDS):
@@ -19,7 +21,7 @@ Ceph иногда переходит в статус `WARN` с ошибками 
 1. Каждые `CHECK_INTERVAL` секунд (по умолчанию 30 с) снимает статус Ceph **только на mst1**:
 
    ```bash
-   docker exec ceph-mon-mst1 ceph health detail
+   sudo docker exec ceph-mon-mst1 ceph health detail
    ```
 
    Статус кластера общий, проверять на всех трёх хостах не требуется.
@@ -45,10 +47,9 @@ Ceph иногда переходит в статус `WARN` с ошибками 
    (`mds.<хост>(mds.<N>)` → хост `<хост>`) и перезапускает **только его**:
 
    ```bash
-   systemctl restart ceph-mds@<хост>.service
+   sudo systemctl restart ceph-mds@<хост>.service   (локально на mst1)
+   ssh <user>@<хост> sudo systemctl restart ceph-mds@<хост>.service  (удалённо)
    ```
-
-   (на целевом хосте — локально, если это mst1, иначе через ssh).
 
 6. После перезапуска отслеживает состояние:
    * если в течение **3 минут** статус всё ещё `WARN` — вводит паузу: больше не
@@ -72,7 +73,7 @@ HEALTH_WARN 2 clients failing to respond to capability release; 1 MDSs report sl
 ```
 
 Из таких строк скрипт выделяет хост `frm-mst1` (или `mst1` в вашей среде) и выполняет
-`systemctl restart ceph-mds@frm-mst1.service` на этом хосте.
+`sudo systemctl restart ceph-mds@frm-mst1.service` на этом хосте.
 
 ## Проверка записи
 
@@ -84,7 +85,7 @@ HEALTH_WARN 2 clients failing to respond to capability release; 1 MDSs report sl
 
 ```
 ceph_mds_monitor.py           # основной скрипт мониторинга (Python 3)
-ceph-mds-monitor.service      # systemd-юнит для запуска как службы на mst1
+ceph-mds-monitor.service      # systemd пользовательский сервис (создаётся install.sh)
 ceph-mds-monitor.env.example  # пример файла переменных окружения
 install.sh                    # вспомогательный скрипт установки
 README.md                     # эта инструкция
@@ -92,22 +93,21 @@ README.md                     # эта инструкция
 
 ## Установка на сервере mst1
 
-Требуются права root (доступ к Docker, ssh, systemd, точкам монтирования).
+Скрипт запускается от обычного пользователя с правами `sudo`. Права root не требуются.
 
 ### 1. Скопировать файлы
 
 ```bash
-sudo mkdir -p /usr/local/share/ceph-mds-monitor
-sudo cp ceph_mds_monitor.py /usr/local/bin/ceph_mds_monitor.py
-sudo chmod +x /usr/local/bin/ceph_mds_monitor.py
-sudo cp ceph-mds-monitor.service /etc/systemd/system/ceph-mds-monitor.service
-sudo cp ceph-mds-monitor.env.example /etc/default/ceph-mds-monitor
+mkdir -p ~/ceph-mds-monitor
+cp ceph_mds_monitor.py ~/ceph-mds-monitor/
+chmod +x ~/ceph-mds-monitor/ceph_mds_monitor.py
+cp ceph-mds-monitor.env.example ~/ceph-mds-monitor/ceph-mds-monitor.env
 ```
 
 ### 2. Отредактировать конфигурацию
 
 ```bash
-sudo nano /etc/default/ceph-mds-monitor
+nano ~/ceph-mds-monitor/ceph-mds-monitor.env
 ```
 
 Минимум что нужно проверить:
@@ -117,39 +117,58 @@ sudo nano /etc/default/ceph-mds-monitor
 | `CEPH_STATUS_HOST` | Хост, с которого снимать статус (по умолчанию `mst1`) |
 | `CEPH_CONTAINER_PREFIX` | Префикс контейнера с ceph CLI, по умолчанию `ceph-mon-` |
 | `CEPH_MON_HOSTS` | Список всех хостов с MDS, например `mst1 mst2 mst3` |
-| `SSH_USER` | Пользователь для ssh на `mst2`/`mst3` (по умолчанию `root`) |
+| `SSH_USER` | Пользователь для ssh на `mst2`/`mst3` |
 | `SSH_KEY` | Путь к приватному ключу ssh (опционально) |
+| `SUDO` | Укажите `sudo`, если запускаете не от root |
 | `CEPH_MOUNT` | Точка монтирования CephFS на mst1, например `/mnt/cephfs` |
 | `WARN_ERROR_PATTERNS` | Признаки ошибок через запятую, на которые реагировать при WARN |
-| `MDS_RESTART_CMD` | Команда перезапуска, по умолчанию `systemctl restart ceph-mds@{host}.service` |
+| `MDS_RESTART_CMD` | Команда перезапуска, по умолчанию `sudo systemctl restart ceph-mds@{host}.service` |
 | `CHECK_INTERVAL` | Как часто проверять (сек), по умолчанию 30 |
+| `LOG_FILE` | Путь к файлу лога (по умолчанию `~/ceph-mds-monitor.log`) |
 
-### 3. SSH без пароля на удалённые хосты
+### 3. Настройка sudo без пароля
+
+Ваш пользователь должен иметь возможность без пароля выполнять через `sudo`:
+* `docker exec ceph-mon-mst1 ceph health detail` (для опроса статуса)
+* `systemctl restart ceph-mds@*.service` (для перезапуска MDS)
+
+Добавьте в `/etc/sudoers` (через `sudo visudo`):
+
+```
+youruser ALL=(ALL) NOPASSWD: /usr/bin/docker exec ceph-mon-mst1 ceph health detail
+youruser ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ceph-mds@*.service
+```
+
+### 4. Настройка ssh без пароля на удалённые хосты
 
 Скрипт запускается на `mst1`, но может перезапускать MDS на `mst2` и `mst3` через ssh.
 Настройте беспарольный доступ:
 
 ```bash
-ssh-copy-id root@mst2
-ssh-copy-id root@mst3
-ssh root@mst2 hostname   # должно выдать mst2 без запроса пароля
-ssh root@mst3 hostname   # должно выдать mst3 без запроса пароля
+ssh-copy-id youruser@mst2
+ssh-copy-id youruser@mst3
+ssh youruser@mst2 hostname   # должно выдать mst2 без запроса пароля
+ssh youruser@mst3 hostname   # должно выдать mst3 без запроса пароля
 ```
 
-### 4. Запустить через systemd
+Также на удалённыхホстах нужно настроить `sudo` без пароля для
+`systemctl restart ceph-mds@*.service`.
+
+### 5. Запуск через systemd (пользовательский сервис)
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now ceph-mds-monitor
-sudo systemctl status ceph-mds-monitor
+./install.sh
+systemctl --user daemon-reload
+systemctl --user enable --now ceph-mds-monitor
+systemctl --user status ceph-mds-monitor
 ```
 
-### 5. Просмотр логов
+### 6. Просмотр логов
 
 ```bash
-sudo journalctl -u ceph-mds-monitor -f
+journalctl --user -u ceph-mds-monitor -f
 # или файл лога, указанный в LOG_FILE:
-tail -f /var/log/ceph-mds-monitor.log
+tail -f ~/ceph-mds-monitor.log
 ```
 
 ## Примеры записей в логе
@@ -160,7 +179,7 @@ tail -f /var/log/ceph-mds-monitor.log
 2026-10-29 12:00:00 [DEBUG] Проверка записи не прошла: rc=124 ...
 2026-10-29 12:00:00 [INFO] WARN с целевой ошибкой, но запись в /mnt/cephfs недоступна — необходимо действовать
 2026-10-29 12:00:00 [INFO] Обнаружен проблемный MDS на хосте mst1 — перезапуск ceph-mds@mst1.service
-2026-10-29 12:00:00 [INFO] Перезапуск MDS на хосте mst1: systemctl restart ceph-mds@mst1.service
+2026-10-29 12:00:00 [INFO] Перезапуск MDS на хосте mst1: sudo systemctl restart ceph-mds@mst1.service
 2026-10-29 12:00:00 [INFO] MDS на хосте mst1 перезапущен успешно (rc=0). —
 2026-10-29 12:00:00 [INFO] Перезапуск MDS выполнен. Отсчёт 3 мин до возможного повторного действия
 2026-10-29 12:03:00 [INFO] Статус Ceph: HEALTH_WARN
@@ -187,7 +206,7 @@ tail -f /var/log/ceph-mds-monitor.log
 ## Разовый запуск для отладки
 
 ```bash
-python3 ceph_mds_monitor.py --once
+python3 ~/ceph-mds-monitor/ceph_mds_monitor.py --once
 ```
 
 ## Лицензия
